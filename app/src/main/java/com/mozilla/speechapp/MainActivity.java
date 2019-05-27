@@ -2,22 +2,21 @@ package com.mozilla.speechapp;
 
 import android.Manifest;
 
-import android.app.Activity;
-import android.app.DownloadManager;
+import android.app.PendingIntent;
 
-import android.content.pm.PackageManager;
 import android.content.BroadcastReceiver;
 import android.content.Context;
-import android.content.Intent;
 import android.content.IntentFilter;
+import android.content.pm.PackageManager;
+import android.content.Intent;
 
-import android.database.Cursor;
+import android.net.ConnectivityManager;
 
 import android.support.annotation.NonNull;
 import android.support.v4.app.ActivityCompat;
+import android.support.v4.app.NotificationCompat;
+import android.support.v4.app.NotificationManagerCompat;
 import android.support.v7.app.AppCompatActivity;
-
-import android.net.Uri;
 
 import android.os.Bundle;
 import android.os.AsyncTask;
@@ -25,7 +24,6 @@ import android.os.AsyncTask;
 import android.util.Log;
 
 import android.view.View;
-import android.view.WindowManager;
 
 import android.widget.Button;
 import android.widget.CompoundButton;
@@ -42,17 +40,21 @@ import com.mozilla.speechlibrary.MozillaSpeechService;
 import com.mozilla.speechlibrary.STTResult;
 import com.mozilla.speechmodule.R;
 
+import java.io.BufferedInputStream;
+import java.io.Closeable;
 import java.io.File;
+import java.io.FileOutputStream;
+import java.io.IOException;
+import java.io.InputStream;
+import java.net.HttpURLConnection;
+import java.net.MalformedURLException;
+import java.net.URL;
 
 import net.lingala.zip4j.core.ZipFile;
 
-import static android.support.constraint.Constraints.TAG;
 
 public class MainActivity extends AppCompatActivity implements ISpeechRecognitionListener, CompoundButton.OnCheckedChangeListener {
-
-    private static long sDownloadId;
-    private static DownloadManager sDownloadManager;
-
+    private static String TAG = "com.mozilla.speechapp.MainActivity";
     private MozillaSpeechService mMozillaSpeechService;
     private GraphView mGraph;
     private long mDtstart;
@@ -195,82 +197,241 @@ public class MainActivity extends AppCompatActivity implements ISpeechRecognitio
         }
     }
 
-    private class AsyncUnzip extends AsyncTask<String, Void, Boolean> {
+    public class ModelDownloadListener {
+        public void onShowMessage(String message) {}
+        public void onProgress(int progress) {}
+        public void onStart() {}
+        public void onSuccess() {}
+        public void onError(Exception ex) {}
+        public void onCancelled() {}
+        public void onEnd() {}
+    }
 
-        @Override
-        protected void onPreExecute() {
-            Toast noModel = Toast.makeText(getApplicationContext(), "Extracting downloaded model", Toast.LENGTH_LONG);
-            mPlain_text_input.append("Extracting downloaded model\n");
-            noModel.show();
+    private class ModelDownloadTask extends AsyncTask<Void, Integer, Boolean> {
+        public ModelDownloadTask(Context context, MozillaSpeechService mMozillaSpeechService, String aModelsPath, String aLang) {
+            this.context = context;
+            this.mMozillaSpeechService = mMozillaSpeechService;
+            this.aModelsPath = aModelsPath;
+            this.aLang = aLang;
+        }
+
+        private Context context;
+        private MozillaSpeechService mMozillaSpeechService;
+        private String aModelsPath;
+        private String aLang;
+
+        private ModelDownloadListener listener = new ModelDownloadListener();
+        private Boolean showNotifications = false;
+        private Boolean showToasts = false;
+
+        private Exception exception;
+        private ModelDownloadTaskReceiver receiver = new ModelDownloadTaskReceiver(this);
+        private NotificationCompat.Builder builder;
+        private NotificationManagerCompat notificationManager;
+        private int notificationId = 1;
+
+        private File zipFile;
+
+        private class ModelDownloadTaskReceiver extends BroadcastReceiver {
+            public ModelDownloadTaskReceiver(ModelDownloadTask task) {
+                this.task = task;
+            }
+
+            private ModelDownloadTask task;
+
+            @Override
+            public void onReceive(Context context, Intent intent) {
+                this.task.cancel(true);
+            }
+        }
+
+        public void setListener(ModelDownloadListener listener) {
+            if (listener == null) {
+                this.listener = new ModelDownloadListener();
+            } else {
+                this.listener = listener;
+            }
+        }
+
+        public ModelDownloadListener listener() {
+            return this.listener;
+        }
+
+        public void setShowNotifications(Boolean showNotifications) {
+            this.showNotifications = showNotifications;
+        }
+
+        public Boolean showNotifications() {
+            return this.showNotifications;
+        }
+
+        public void setShowToasts(Boolean showToasts) {
+            this.showToasts = showToasts;
+        }
+
+        public Boolean showToasts() {
+            return this.showToasts;
+        }
+
+        private void showMessage(String message) {
+            if (showToasts) {
+                Toast.makeText(context, message, Toast.LENGTH_LONG).show();
+            }
+            listener.onShowMessage(message);
+        }
+
+        private void tryClose(Closeable closable) {
+            try {
+                if (closable != null) {
+                    closable.close();
+                }
+            } catch(Exception ex) {}
         }
 
         @Override
-        protected Boolean doInBackground(String...params) {
-            String aZipFile = params[0], aRootModelsPath = params[1];
+        protected void onPreExecute() {
+            ConnectivityManager connectivity = (ConnectivityManager)getSystemService(Context.CONNECTIVITY_SERVICE);
+            if (connectivity.isActiveNetworkMetered()) {
+                showMessage("Download too big. Please switch to WIFI or create a wired connection first.");
+                this.cancel(true);
+                return;
+            }
+            if (showNotifications) {
+                String CHANNEL_ID = "ModelDownload";
+                Intent stopIntent = new Intent();
+                stopIntent.setAction("com.mozilla.speechapp.stopModelDownload");
+                PendingIntent stopPendingIntent = PendingIntent.getBroadcast(this.context, 0, stopIntent, PendingIntent.FLAG_UPDATE_CURRENT);
+                NotificationCompat.Action stopAction = new NotificationCompat.Action.Builder(0, "Stop download", stopPendingIntent).build();
+
+                this.notificationManager = NotificationManagerCompat.from(this.context);
+                this.builder = new NotificationCompat.Builder(this.context, CHANNEL_ID);
+                this.builder
+                    .setContentTitle("Retrieving " + aLang + " data")
+                    .setContentText("Download in progress")
+                    .setSmallIcon(R.drawable.ic_download)
+                    .setPriority(NotificationCompat.PRIORITY_LOW)
+                    .setAutoCancel(true)
+                    .addAction(stopAction);
+
+                this.context.registerReceiver(this.receiver, new IntentFilter(stopIntent.getAction()));
+            }
+            listener.onStart();
+        }
+
+        @Override
+        protected Boolean doInBackground(Void... voids) {
+            URL modelZipURL;
             try {
-                ZipFile zf = new ZipFile(aZipFile);
-                zf.extractAll(aRootModelsPath);
-            } catch (Exception e) {
-                Log.d(TAG, e.getLocalizedMessage());
-                e.printStackTrace();
+                modelZipURL = new URL(this.mMozillaSpeechService.getModelDownloadURL());
+            } catch (MalformedURLException ex) {
+                showMessage("Wrong URL");
+                return false;
             }
 
-            return (new File(aZipFile)).delete();
+            this.zipFile = new File(this.aModelsPath + "/" + this.aLang + ".zip");
+            HttpURLConnection urlConnection = null;
+            InputStream in = null;
+            FileOutputStream out = null;
+
+            try {
+                urlConnection = (HttpURLConnection) modelZipURL.openConnection();
+                in = new BufferedInputStream(urlConnection.getInputStream());
+                out = new FileOutputStream(zipFile);
+                long totalSize = Long.parseLong(urlConnection.getHeaderField("content-length"));
+                byte[] buffer = new byte[4096];
+                int bytesRead;
+                long bytesWritten = 0;
+                int lastProgress = -1;
+                while ((bytesRead = in.read(buffer)) > 0) {
+                    out.write(buffer, 0, bytesRead);
+                    bytesWritten += bytesRead;
+                    int progress = (int)((bytesWritten * 100l) / totalSize);
+                    if (lastProgress != progress) {
+                        publishProgress(progress);
+                        lastProgress = progress;
+                    }
+                }
+            } catch (IOException ioEx) {
+                this.exception = ioEx;
+                return false;
+            } finally {
+                tryClose(in);
+                tryClose(out);
+            }
+            try {
+                ZipFile zf = new ZipFile(this.zipFile);
+                zf.extractAll(this.aModelsPath);
+            } catch (Exception zipEx) {
+                this.exception = zipEx;
+                return false;
+            } finally {
+                this.zipFile.delete();
+            }
+            return true;
+        }
+
+        @Override
+        protected void onProgressUpdate(Integer... progress) {
+            if (showNotifications) {
+                builder.setProgress(100, progress[0], false);
+                notificationManager.notify(notificationId, builder.build());
+            }
+            listener.onProgress(progress[0]);
+        }
+
+        @Override
+        protected void onCancelled() {
+            if (showNotifications) {
+                this.notificationManager.cancel(this.notificationId);
+            }
+            showMessage("Download cancelled");
+            listener.onCancelled();
+            listener.onEnd();
         }
 
         @Override
         protected void onPostExecute(Boolean result) {
-            Button buttonStart = findViewById(R.id.button_start), buttonCancel = findViewById(R.id.button_cancel);
-            mMozillaSpeechService.start(getApplicationContext());
-            buttonStart.setEnabled(true);
-            buttonCancel.setEnabled(true);
+            if (this.exception != null) {
+                showMessage("Download failed");
+                this.exception.printStackTrace();
+                listener.onError(this.exception);
+            } else {
+                showMessage("Download complete");
+                listener.onSuccess();
+            }
+            if (showNotifications) {
+                this.notificationManager.cancel(this.notificationId);
+            }
+            listener.onEnd();
         }
-
     }
 
     public void maybeDownloadOrExtractModel(String aModelsPath, String aLang) {
-        String zipFile   = aModelsPath + "/" + aLang + ".zip";
-        Uri modelZipURL  = Uri.parse(mMozillaSpeechService.getModelDownloadURL());
-        Uri modelZipFile = Uri.parse("file://" + zipFile);
-
         Button buttonStart = findViewById(R.id.button_start), buttonCancel = findViewById(R.id.button_cancel);
-        buttonStart.setEnabled(false);
-        buttonCancel.setEnabled(false);
-
-        BroadcastReceiver receiver = new BroadcastReceiver() {
+        ModelDownloadTask download = new ModelDownloadTask(this.getApplicationContext(), mMozillaSpeechService, aModelsPath, aLang);
+        download.setShowNotifications(true);
+        download.setShowToasts(true);
+        download.setListener(new ModelDownloadListener() {
             @Override
-            public void onReceive(Context context, Intent intent) {
-                String action = intent.getAction();
-                if (DownloadManager.ACTION_DOWNLOAD_COMPLETE.equals(action)) {
-                    long downloadId = intent.getLongExtra(DownloadManager.EXTRA_DOWNLOAD_ID, 0);
-                    DownloadManager.Query query = new DownloadManager.Query();
-                    query.setFilterById(downloadId);
-                    Cursor c = sDownloadManager.query(query);
-                    if (c.moveToFirst()) {
-                        int columnIndex = c.getColumnIndex(DownloadManager.COLUMN_STATUS);
-                        if (DownloadManager.STATUS_SUCCESSFUL == c.getInt(columnIndex)) {
-                            Log.d(TAG, "Download successfull");
-
-                            new AsyncUnzip().execute(zipFile, aModelsPath);
-                        }
-                    }
-                }
+            public void onShowMessage(String message) {
+                super.onShowMessage(message);
+                mPlain_text_input.append(message + "\n");
             }
-        };
 
-        Toast noModel = Toast.makeText(getApplicationContext(), "No model has been found for language '" + aLang + "'. Triggering download ...", Toast.LENGTH_LONG);
-        mPlain_text_input.append("No model has been found for language '" + aLang + "'. Triggering download ...\n");
-        noModel.show();
+            @Override
+            public void onStart() {
+                super.onStart();
+                buttonStart.setEnabled(false);
+                buttonCancel.setEnabled(false);
+            }
 
-        sDownloadManager = (DownloadManager) getSystemService(Context.DOWNLOAD_SERVICE);
-        DownloadManager.Request request = new DownloadManager.Request(modelZipURL);
-        request.setTitle("DeepSpeech " + aLang);
-        request.setDescription("DeepSpeech Model");
-        request.setNotificationVisibility(DownloadManager.Request.VISIBILITY_VISIBLE_NOTIFY_COMPLETED);
-        request.setVisibleInDownloadsUi(false);
-        request.setDestinationUri(modelZipFile);
-        sDownloadId = sDownloadManager.enqueue(request);
-
-        getApplicationContext().registerReceiver(receiver, new IntentFilter(DownloadManager.ACTION_DOWNLOAD_COMPLETE));
+            @Override
+            public void onEnd() {
+                super.onEnd();
+                buttonStart.setEnabled(true);
+                buttonCancel.setEnabled(false);
+            }
+        });
+        download.execute();
     }
 }

@@ -2,7 +2,6 @@ package com.mozilla.speechlibrary;
 
 import android.content.Context;
 import android.os.Looper;
-import android.util.Log;
 import com.loopj.android.http.AsyncHttpResponseHandler;
 import com.loopj.android.http.SyncHttpClient;
 import org.json.JSONArray;
@@ -10,7 +9,6 @@ import org.json.JSONObject;
 import cz.msebera.android.httpclient.Header;
 import cz.msebera.android.httpclient.entity.ByteArrayEntity;
 import java.io.ByteArrayOutputStream;
-import static com.mozilla.speechlibrary.MozillaSpeechService.TAG;
 
 public class Networking {
 

@@ -201,6 +201,7 @@ class LocalSpeechRecognition implements Runnable {
         mLanguages.put("fr-FR", "fra");
     }
 
+    // Use address 10.0.2.2 for emulator access to localhost of dev-box
     private static String kBaseModelURL = "https://github.com/lissyx/DeepSpeech/releases/download/android-test/";
 
     protected LocalSpeechRecognition(int aSampleRate, int aChannels, Vad aVad,
