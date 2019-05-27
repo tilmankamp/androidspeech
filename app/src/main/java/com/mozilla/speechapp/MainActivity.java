@@ -44,13 +44,18 @@ import java.io.BufferedInputStream;
 import java.io.Closeable;
 import java.io.File;
 import java.io.FileOutputStream;
+import java.io.FilterInputStream;
 import java.io.IOException;
 import java.io.InputStream;
+
 import java.net.HttpURLConnection;
 import java.net.MalformedURLException;
 import java.net.URL;
 
-import net.lingala.zip4j.core.ZipFile;
+import org.apache.commons.compress.archivers.ArchiveEntry;
+import org.apache.commons.compress.archivers.ArchiveInputStream;
+import org.apache.commons.compress.archivers.zip.ZipArchiveInputStream;
+import org.apache.commons.compress.utils.IOUtils;
 
 
 public class MainActivity extends AppCompatActivity implements ISpeechRecognitionListener, CompoundButton.OnCheckedChangeListener {
@@ -197,6 +202,60 @@ public class MainActivity extends AppCompatActivity implements ISpeechRecognitio
         }
     }
 
+    public class ByteCountStream extends FilterInputStream {
+        private volatile long totalBytesRead = 0l;
+
+        public ByteCountStream(InputStream in) {
+            super(in);
+        }
+
+        @Override
+        public void mark(int readlimit) {
+            throw new UnsupportedOperationException();
+        }
+
+        @Override
+        public void reset() {
+            throw new UnsupportedOperationException();
+        }
+
+        @Override
+        public boolean markSupported() {
+            return false;
+        }
+
+        @Override
+        public int read() throws IOException {
+            int b = super.read();
+            return b;
+        }
+
+        @Override
+        public int read(byte[] b) throws IOException {
+            return read(b, 0, b.length);
+        }
+
+        @Override
+        public int read(byte[] b, int off, int len) throws IOException {
+            return (int)checkProgress(super.read(b, off, len));
+        }
+
+        @Override
+        public long skip(long n) throws IOException {
+            return checkProgress(super.skip(n));
+        }
+
+        private long checkProgress(long bytesRead) {
+            if (bytesRead > 0) {
+                this.totalBytesRead += bytesRead;
+                onBytesRead(this.totalBytesRead);
+            }
+            return bytesRead;
+        }
+        
+        public void onBytesRead(long totalBytesRead) {}
+    }
+
     public class ModelDownloadListener {
         public void onShowMessage(String message) {}
         public void onProgress(int progress) {}
@@ -229,8 +288,6 @@ public class MainActivity extends AppCompatActivity implements ISpeechRecognitio
         private NotificationCompat.Builder builder;
         private NotificationManagerCompat notificationManager;
         private int notificationId = 1;
-
-        private File zipFile;
 
         private class ModelDownloadTaskReceiver extends BroadcastReceiver {
             public ModelDownloadTaskReceiver(ModelDownloadTask task) {
@@ -328,27 +385,50 @@ public class MainActivity extends AppCompatActivity implements ISpeechRecognitio
                 return false;
             }
 
-            this.zipFile = new File(this.aModelsPath + "/" + this.aLang + ".zip");
             HttpURLConnection urlConnection = null;
             InputStream in = null;
-            FileOutputStream out = null;
 
             try {
                 urlConnection = (HttpURLConnection) modelZipURL.openConnection();
-                in = new BufferedInputStream(urlConnection.getInputStream());
-                out = new FileOutputStream(zipFile);
                 long totalSize = Long.parseLong(urlConnection.getHeaderField("content-length"));
-                byte[] buffer = new byte[4096];
-                int bytesRead;
-                long bytesWritten = 0;
-                int lastProgress = -1;
-                while ((bytesRead = in.read(buffer)) > 0) {
-                    out.write(buffer, 0, bytesRead);
-                    bytesWritten += bytesRead;
-                    int progress = (int)((bytesWritten * 100l) / totalSize);
-                    if (lastProgress != progress) {
-                        publishProgress(progress);
-                        lastProgress = progress;
+                ByteCountStream bcs = new ByteCountStream(urlConnection.getInputStream()) {
+                    private int lastProgress = -1;
+
+                    @Override
+                    public void onBytesRead(long totalBytesRead) {
+                        int progress = (int)(totalBytesRead * 100l / totalSize);
+                        if (progress != this.lastProgress) {
+                            publishProgress(progress);
+                        }
+                        this.lastProgress = progress;
+                    }
+                };
+                in = new BufferedInputStream(bcs);
+
+                File targetDir = new File(aModelsPath).getAbsoluteFile();
+                ArchiveInputStream ais = new ZipArchiveInputStream(in);
+                ArchiveEntry tarEntry;
+                while ((tarEntry = ais.getNextEntry()) != null) {
+                    Log.d(TAG, "Target: " + tarEntry);
+                    if (!ais.canReadEntryData(tarEntry)) {
+                        continue;
+                    }
+                    File targetFile = new File(targetDir, tarEntry.toString()).getAbsoluteFile();
+                    if (targetFile.getPath().length() < targetDir.getPath().length()) {
+                        throw new IOException("Path outside target directory: " + targetFile);
+                    }
+                    if (tarEntry.isDirectory()) {
+                        if (!targetFile.isDirectory() && !targetFile.mkdirs()) {
+                            throw new IOException("Failed to create directory " + targetFile);
+                        }
+                    } else {
+                        File parentDirectory = targetFile.getParentFile();
+                        if (!parentDirectory.isDirectory() && !parentDirectory.mkdirs()) {
+                            throw new IOException("Failed to create directory " + parentDirectory);
+                        }
+                        try (FileOutputStream out = new FileOutputStream(targetFile.getPath())) {
+                            IOUtils.copy(ais, out);
+                        }
                     }
                 }
             } catch (IOException ioEx) {
@@ -356,16 +436,6 @@ public class MainActivity extends AppCompatActivity implements ISpeechRecognitio
                 return false;
             } finally {
                 tryClose(in);
-                tryClose(out);
-            }
-            try {
-                ZipFile zf = new ZipFile(this.zipFile);
-                zf.extractAll(this.aModelsPath);
-            } catch (Exception zipEx) {
-                this.exception = zipEx;
-                return false;
-            } finally {
-                this.zipFile.delete();
             }
             return true;
         }
