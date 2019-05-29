@@ -1,6 +1,5 @@
 package com.mozilla.speechlibrary;
 
-import android.content.Context;
 import android.media.AudioRecord;
 import android.os.Process;
 import com.github.axet.audiolibrary.encoders.Sound;
@@ -100,7 +99,7 @@ class LocalDSInference implements Runnable {
         Log.e(this._tag, "closeModel()");
 
         if (this.mStreamingState != null) {
-             String _ = this.mModel.finishStream(this.mStreamingState);
+             this.mModel.finishStream(this.mStreamingState);
         }
 
         if (this.mModel != null) {
